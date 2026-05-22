@@ -383,6 +383,36 @@ func BreadthFirstSearchParallelEx[K comparable, N any](
 
 Line 145: `wg.Wait()` blocks the caller (dispatchLoop via the call stack: dispatchLoop → handler → DidOpenFile → UpdateSnapshot → Clone → BFS) waiting for all worker goroutines to finish; workers call `ProgressFinish()` which blocks trying to send to `p.ch`.
 
+## Possible fixes
+
+Sketches only — each references the code labels (a)–(n) above. This repo is a reproduction kit, not a patch; the items below are starting points for someone with the codebase open.
+
+### 1. Don't let `readLoop` block on `requestQueue` (most surgical)
+
+The deadlock requires that `readLoop` (c) cannot drain the next message from the wire while `dispatchLoop` waits on a server→client response (i). Today `readLoop` blocks on the bounded `requestQueue` (a, capacity 100), so a response queued behind a request can never be read.
+
+Make the readLoop→queue handoff non-blocking: buffer overflow in an unbounded slice that `dispatchLoop` drains alongside `requestQueue`, or move the channel send onto a separate goroutine fed by an internal buffer. Either way the wire reader stays free, responses always reach `pendingServerRequests`, and back-pressure becomes "the queue grows" rather than "the server hangs".
+
+### 2. Issue `createWorkDoneProgress` without parking on the response
+
+`projectLoadingProgress.run` (j) waits synchronously for the client's reply to `window/workDoneProgress/create` via `sendClientRequest` (i). If the create were fire-and-forget — start reporting progress on the token immediately, asynchronously consume (or ignore) the reply — project-loading no longer needs a round-trip while a handler is mid-flight.
+
+This is the smallest change that breaks the specific cycle the reproduction triggers, and is independent of fix 1.
+
+### 3. Run handlers off `dispatchLoop`
+
+`dispatchLoop` (d) calls `handleRequestOrNotification` synchronously. Handlers like `DidOpenFile` (m) reach `BreadthFirstSearchParallelEx`'s `wg.Wait` (n); workers inside call `ProgressFinish` (l → k), which parks if the project-loading channel is full. Whenever a handler triggers a server→client round-trip, the sole consumer of `requestQueue` is parked.
+
+A worker pool fed by `requestQueue` would keep `dispatchLoop` free to drain incoming messages while handlers run elsewhere. Larger change, but it removes the whole "re-enter the wire while parked" pattern rather than just this instance of it.
+
+### 4. Make log delivery from handlers non-blocking
+
+`handleRequestOrNotification` (e) calls `logger.Info`/`logger.Error` synchronously. `logger.sendLogMessage` (h) sends into `outgoingQueue` (b) — also bounded at 100 — via a `select` that parks on a full queue. Under burst load this can park `dispatchLoop` itself before any progress request is even issued. Drop or batch to stderr when the queue is full, or give log notifications a separate, larger channel.
+
+### What doesn't fix it
+
+Raising the `requestQueue`/`outgoingQueue` capacities (a, b) defers the problem to a larger burst but doesn't eliminate it. Clients setting `window.workDoneProgress: false` would avoid the path in fix 2 but leaves the head-of-line block in fix 1 intact.
+
 ## Files
 
 - `generate_workspace.sh` — creates a TypeScript project with N files and cross-file imports
